@@ -55,7 +55,15 @@ cp "$temp_dir/$asset_name" "$install_dir/path-to-link"
 chmod 755 "$install_dir/path-to-link"
 
 shell_path=$(printenv SHELL 2>/dev/null || printf 'sh')
-case "$(basename "$shell_path")" in
+shell_name=$(basename "$shell_path")
+case "$shell_name" in
+    fish)
+        profile_file="$HOME/.config/fish/config.fish"
+        mkdir -p "$(dirname "$profile_file")"
+        if ! grep -Fq '.local/bin' "$profile_file" 2>/dev/null; then
+            printf '\n# Path-to-Link\nset -gx PATH "$HOME/.local/bin" $PATH\n' >> "$profile_file"
+        fi
+        ;;
     zsh) profile_file="$HOME/.zprofile" ;;
     bash)
         if [ -f "$HOME/.bash_profile" ]; then
@@ -67,7 +75,7 @@ case "$(basename "$shell_path")" in
     *) profile_file="$HOME/.profile" ;;
 esac
 
-if ! grep -Fq '.local/bin' "$profile_file" 2>/dev/null; then
+if [ "$shell_name" != 'fish' ] && ! grep -Fq '.local/bin' "$profile_file" 2>/dev/null; then
     printf '\n# Path-to-Link\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$profile_file"
 fi
 
