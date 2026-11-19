@@ -1,97 +1,183 @@
-# Path-to-Link
+<div align="center">
 
-Path-to-Link is a Rust local file server that turns an allowed filesystem path into a temporary HTTP link. It is intended for developer tools and AI agents that can consume URLs but cannot read local paths directly.
+# 🔗 Path-to-Link
 
-The file stays on the host machine. Path-to-Link serves it on demand and does not upload or duplicate it. By default, the HTTP server binds to loopback. A link has its own secret access token, can expire automatically, and can be revoked.
+### Local files, temporary links, and full control.
 
-## Requirements
+Share an approved file with a local tool or AI agent over HTTP — without uploading or duplicating the file.
 
-- Rust stable and Cargo
-- Windows, macOS, or Linux
+[![Latest release](https://img.shields.io/github/v/release/BrThiagoN/path-to-link?display_name=tag&label=release)](https://github.com/BrThiagoN/path-to-link/releases/latest)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-7c3aed)](#installation)
 
-## Build
+[Installation](#installation) · [Quick start](#quick-start) · [MCP](#mcp-setup) · [Security](#security) · [Development](#development)
+
+</div>
+
+---
+
+Path-to-Link serves files directly from your machine. You choose which folders are allowed, each link gets a private token and an expiry time, and you can revoke it whenever you want.
+
+## ✨ What it does
+
+| | |
+|---|---|
+| 📁 **Folder allowlist** | Shares only files inside roots you explicitly approve. |
+| ⏱️ **Temporary links** | Links expire automatically; the default is 15 minutes. |
+| 🔐 **Private access tokens** | Every link has its own high-entropy token. |
+| 🚫 **Instant revocation** | Revoke a link at any time. |
+| 🖥️ **Local by default** | The HTTP server binds to loopback unless you choose another interface. |
+| 🤖 **MCP and CLI** | Use it from an MCP client or manage a standalone server from your terminal. |
+
+## Installation
+
+### Windows
+
+Run this in PowerShell:
 
 ```powershell
-cargo build --release
+irm https://raw.githubusercontent.com/BrThiagoN/path-to-link/main/install.ps1 | iex
 ```
 
-## MCP mode
+The installer downloads the latest Windows build, checks its SHA-256 checksum, and adds Path-to-Link to your user PATH.
 
-The MCP command starts the stdio server and an HTTP listener on an available loopback port. The listener runs in the same process as MCP, so it stays available while the agent session is active.
+### macOS and Linux
 
-Example MCP client configuration (adapt this JSON structure to the client's settings format):
+Run this in a terminal:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/BrThiagoN/path-to-link/main/install.sh | sh
+```
+
+The installer detects your CPU, verifies the download checksum, installs to `~/.local/bin`, and adds that directory to your shell profile if needed. Open a new terminal after installation.
+
+### Install from source
+
+If you already have stable Rust and Cargo installed:
+
+```sh
+cargo install --git https://github.com/BrThiagoN/path-to-link
+```
+
+Check that it is ready:
+
+```sh
+path-to-link --help
+```
+
+> **No release available yet?** The installers download the latest published release. Until the first release is created, install from source or build locally with `cargo build --release`.
+
+## Quick start
+
+Start the MCP server and allow it to share files from one folder:
+
+```sh
+path-to-link mcp --allow-root "/path/to/shared-files"
+```
+
+For example, on Windows:
+
+```powershell
+path-to-link mcp --allow-root "C:/Users/you/Shared"
+```
+
+The MCP server starts an HTTP listener on an available loopback port and exposes three tools:
+
+| Tool | Purpose |
+|---|---|
+| `share_file` | Create a temporary link for a file under an allowed root. |
+| `list_shares` | See active links and their remaining lifetime. |
+| `revoke_share` | Disable a link immediately. |
+
+Each share is independent, so you can keep several links active at once. The default lifetime is 900 seconds; the maximum is 86,400 seconds.
+
+## MCP setup
+
+Add Path-to-Link to your MCP client's configuration. Replace the example path with a folder on your machine:
 
 ```json
 {
   "mcpServers": {
     "path-to-link": {
-      "command": "C:\\path\\to\\path-to-link.exe",
+      "command": "path-to-link",
       "args": [
         "mcp",
         "--allow-root",
-        "C:\\Users\\user\\Shared"
+        "C:/Users/you/Shared"
       ]
     }
   }
 }
 ```
 
-The MCP tools are:
+The exact configuration file varies by MCP client. If the client cannot find `path-to-link`, use the full path to the installed executable.
 
-- `share_file`: accept an absolute file path and optional lifetime; return a URL and share ID.
-- `list_shares`: list active links and remaining lifetimes.
-- `revoke_share`: immediately disable a link by ID.
+The client and the file-consuming tool must be able to reach the same machine and network namespace. The default `127.0.0.1` address works when both run on the same host.
 
-Every share has its own ID and access token. Multiple shares stay active concurrently. The default lifetime is 900 seconds; the maximum is 86400 seconds. Keep the MCP process alive until the client has finished fetching the file.
+## Standalone HTTP server
 
-For any MCP workflow that needs a file URL, call `share_file` with the local path and pass the returned URL to the consuming tool. If both processes can reach the same host and network namespace, the default loopback URL works without publishing the file to the internet. If the consumer runs elsewhere, bind the HTTP server to a reachable interface and provide a matching `--public-base-url`; the file must be reachable from that client's network.
+Use standalone mode when you want a long-running HTTP server and CLI commands that manage it.
 
-## Standalone HTTP mode
-
-Use this mode when CLI commands should manage one long-running server. The control API requires a bearer token; set it in the environment rather than putting it in the command line.
+Start the server in one terminal:
 
 ```powershell
-$env:PATH_TO_LINK_CONTROL_TOKEN = (& .\target\release\path-to-link.exe token)
-& .\target\release\path-to-link.exe serve --allow-root "C:\Shared"
+$env:PATH_TO_LINK_CONTROL_TOKEN = (& path-to-link token)
+path-to-link serve --allow-root "C:/Users/you/Shared"
 ```
 
-In another PowerShell session, set the same `PATH_TO_LINK_CONTROL_TOKEN`, then use:
+Then create and manage links from another terminal:
 
 ```powershell
-& .\target\release\path-to-link.exe share "C:\Shared\example.pdf" --expires-in 3600
-& .\target\release\path-to-link.exe list
-& .\target\release\path-to-link.exe revoke <share-id>
+$env:PATH_TO_LINK_CONTROL_TOKEN = "paste-the-same-token-here"
+path-to-link share "C:/Users/you/Shared/example.pdf" --expires-in 3600
+path-to-link list
+path-to-link revoke <share-id>
 ```
 
-`PATH_TO_LINK_URL` selects another server address; the default is `http://127.0.0.1:38751`.
+Keep the control token in an environment variable. Do not place it directly in a command that may be saved in shell history.
 
-To allow a client on the LAN, bind to a specific interface or `0.0.0.0` and provide `--public-base-url` with the address clients can reach. The control API remains protected by its control token; file URLs carry a separate per-share bearer token. Use LAN mode only on a network where those URLs can be protected.
+## Security
 
-## Project goals
+- Only files below a configured `--allow-root` can be shared. Path-to-Link resolves paths before checking them.
+- The server binds to `127.0.0.1` by default. A non-loopback bind requires an explicit `--public-base-url`.
+- A share URL contains its own access token. Anyone with the full URL can fetch that file until the link expires or is revoked. Treat the URL as a secret.
+- Files are streamed from disk on demand; they are not copied into Path-to-Link or uploaded by the server.
+- Share records live in memory. Restarting the process revokes all active links.
 
-- Several shares can be active at the same time; creating a new share never replaces another one.
-- An MCP server exposes `share_file`, `list_shares`, and `revoke_share`.
-- A CLI supports starting the HTTP service and managing shares.
-- Only files below configured allowed roots can be shared. Canonical path checks resolve symbolic links before authorizing a file.
-- Share expiration and explicit revocation stop future requests immediately.
-- Localhost is the default. Binding to a LAN address must be an explicit choice.
-- The HTTP endpoint streams the original file over standard HTTP and supports range requests for clients that need streaming or partial reads.
+Use a non-loopback bind only when the consuming client must connect from another device, and only on a network where you can protect the URLs.
 
-## Architecture
+## Supported release builds
 
-The executable provides three interfaces over one in-memory share registry:
+| Operating system | Architectures |
+|---|---|
+| Windows | x86-64, ARM64 |
+| macOS | Intel (x86-64), Apple silicon (ARM64) |
+| Linux | x86-64, ARM64 |
 
-1. An Axum/Tokio HTTP server streams files from disk.
-2. An MCP stdio server lets an agent create, list, and revoke shares. Its normal mode starts the HTTP listener alongside MCP.
-3. CLI commands manage a separately running HTTP server.
+Release binaries are provided by the project and do not require Rust to be installed. The macOS and Linux installer uses `curl` or `wget`; the Windows installer uses PowerShell.
 
-Share records are temporary and live in memory. Restarting the server revokes its active shares. A local MCP client and the file-consuming API must be able to reach the returned HTTP address; `127.0.0.1` is only reachable from the same host/network namespace.
+## Build a release
+
+Maintainers can publish a version by pushing a tag such as `v0.1.0`:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+GitHub Actions builds binaries for the supported platforms, generates SHA-256 checksums, and attaches them to a GitHub Release.
 
 ## Development
 
-```powershell
+Requirements: stable Rust and Cargo.
+
+```sh
 cargo fmt --all
-cargo check
+cargo check --locked
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for implementation guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for project contribution notes.
+
+## License
+
+Path-to-Link is available under the [MIT License](LICENSE).
