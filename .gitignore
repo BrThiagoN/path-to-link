@@ -1,0 +1,8 @@
+/target/
+/.agents/
+/.env
+/.env.*
+*.log
+*.tmp
+path-to-link.toml
+
