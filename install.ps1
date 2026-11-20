@@ -7,12 +7,12 @@ function Get-ExpectedSha256 {
     )
 
     if ([string]::IsNullOrWhiteSpace($ChecksumText)) {
-        throw "The SHA-256 file for $AssetName is empty. The release may be incomplete; try again later."
+        throw [System.IO.InvalidDataException]::new("The SHA-256 file for $AssetName is empty. The release may be incomplete; try again later.")
     }
 
     $expected = ($ChecksumText.Trim() -split '\s+')[0]
     if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
-        throw "The SHA-256 file for $AssetName is invalid. The release may be incomplete; try again later."
+        throw [System.IO.InvalidDataException]::new("The SHA-256 file for $AssetName is invalid. The release may be incomplete; try again later.")
     }
 
     return $expected.ToLowerInvariant()
