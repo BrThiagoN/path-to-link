@@ -2,12 +2,12 @@
 
 ## Purpose
 
-Build a local Rust service that exposes approved local files through temporary HTTP links for tools such as CapCut MCP, Codex, OpenCode, and Claude Code.
+Build a local Rust service that exposes approved local files through temporary HTTP links for MCP clients and other tools that accept HTTP file URLs.
 
 ## Architecture
 
 - Use Tokio and Axum for concurrent HTTP requests.
-- Use Tower HTTP file serving so clients can stream media and request byte ranges.
+- Use Tower HTTP file serving so clients can stream files and request byte ranges.
 - Use `rmcp` over stdio for the MCP interface.
 - Keep MCP, CLI, and HTTP operations connected to the same share registry when they run in one process.
 - Keep the default bind address on `127.0.0.1`.
