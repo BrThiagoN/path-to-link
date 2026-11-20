@@ -1,5 +1,23 @@
 $ErrorActionPreference = 'Stop'
 
+function Get-ExpectedSha256 {
+    param(
+        [AllowNull()][string]$ChecksumText,
+        [Parameter(Mandatory)][string]$AssetName
+    )
+
+    if ([string]::IsNullOrWhiteSpace($ChecksumText)) {
+        throw [System.IO.InvalidDataException]::new("The SHA-256 file for $AssetName is empty. The release may be incomplete; try again later.")
+    }
+
+    $expected = ($ChecksumText.Trim() -split '\s+')[0]
+    if ($expected -notmatch '^[0-9a-fA-F]{64}$') {
+        throw [System.IO.InvalidDataException]::new("The SHA-256 file for $AssetName is invalid. The release may be incomplete; try again later.")
+    }
+
+    return $expected.ToLowerInvariant()
+}
+
 $repository = 'BrThiagoN/path-to-link'
 $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
 
@@ -36,7 +54,8 @@ try {
     Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $downloadPath -UseBasicParsing
     Invoke-WebRequest -Uri $checksumAsset.browser_download_url -OutFile $checksumPath -UseBasicParsing
 
-    $expected = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    $checksumText = Get-Content -LiteralPath $checksumPath -Raw
+    $expected = Get-ExpectedSha256 -ChecksumText $checksumText -AssetName $assetName
     $actual = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($actual -ne $expected) {
         throw 'The downloaded file failed its SHA-256 check.'

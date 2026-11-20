@@ -9,8 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  test:
+    name: Installer regression tests
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Test installer checksum handling
+        shell: pwsh
+        run: ./tests/install-checksum.ps1
+
   build:
     name: Build ${{ matrix.target }}
+    needs: test
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -74,8 +87,10 @@ jobs:
         env:
           ASSET: ${{ matrix.asset }}
         run: |
-          $hash = (Get-FileHash -LiteralPath "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath "dist/$env:ASSET.sha256" -Value "$hash  $env:ASSET" -NoNewline
+          $assetPath = "dist/$($env:ASSET)"
+          $checksumPath = "$assetPath.sha256"
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath $checksumPath -Value "$hash  $env:ASSET" -Encoding ascii
 
       - name: Create SHA-256 checksum
         if: runner.os != 'Windows'
@@ -84,10 +99,11 @@ jobs:
           ASSET: ${{ matrix.asset }}
         run: |
           if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "dist/$ASSET" > "dist/$ASSET.sha256"
+            hash=$(sha256sum "dist/$ASSET" | awk '{print $1}')
           else
-            shasum -a 256 "dist/$ASSET" > "dist/$ASSET.sha256"
+            hash=$(shasum -a 256 "dist/$ASSET" | awk '{print $1}')
           fi
+          printf '%s  %s\n' "$hash" "$ASSET" > "dist/$ASSET.sha256"
 
       - name: Upload build artifact
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
