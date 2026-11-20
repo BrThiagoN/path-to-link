@@ -74,8 +74,10 @@ jobs:
         env:
           ASSET: ${{ matrix.asset }}
         run: |
-          $hash = (Get-FileHash -LiteralPath "dist/$env:ASSET" -Algorithm SHA256).Hash.ToLowerInvariant()
-          Set-Content -LiteralPath "dist/$env:ASSET.sha256" -Value "$hash  $env:ASSET" -NoNewline
+          $assetPath = "dist/$($env:ASSET)"
+          $checksumPath = "$assetPath.sha256"
+          $hash = (Get-FileHash -LiteralPath $assetPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          Set-Content -LiteralPath $checksumPath -Value "$hash  $env:ASSET" -Encoding ascii -NoNewline
 
       - name: Create SHA-256 checksum
         if: runner.os != 'Windows'
