@@ -1,0 +1,66 @@
+$ErrorActionPreference = 'Stop'
+
+$repository = 'BrThiagoN/path-to-link'
+$architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+
+switch ($architecture) {
+    'X64'   { $target = 'x86_64-pc-windows-msvc' }
+    'Arm64' { $target = 'aarch64-pc-windows-msvc' }
+    default { throw "Unsupported Windows architecture: $architecture" }
+}
+
+$assetName = "path-to-link-$target.exe"
+$headers = @{
+    Accept = 'application/vnd.github+json'
+    'X-GitHub-Api-Version' = '2022-11-28'
+}
+
+try {
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers $headers
+} catch {
+    throw 'Could not find a published Path-to-Link release. Install from source with: cargo install --git https://github.com/BrThiagoN/path-to-link'
+}
+
+$asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+$checksumAsset = $release.assets | Where-Object { $_.name -eq "$assetName.sha256" } | Select-Object -First 1
+if ($null -eq $asset -or $null -eq $checksumAsset) {
+    throw "The latest release does not include a build for $architecture."
+}
+
+$tempDir = Join-Path ([System.IO.Path]::GetTempPath()) "path-to-link-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $tempDir | Out-Null
+
+try {
+    $downloadPath = Join-Path $tempDir $assetName
+    $checksumPath = Join-Path $tempDir "$assetName.sha256"
+    Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $downloadPath -UseBasicParsing
+    Invoke-WebRequest -Uri $checksumAsset.browser_download_url -OutFile $checksumPath -UseBasicParsing
+
+    $expected = ((Get-Content -LiteralPath $checksumPath -Raw).Trim() -split '\s+')[0].ToLowerInvariant()
+    $actual = (Get-FileHash -LiteralPath $downloadPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($actual -ne $expected) {
+        throw 'The downloaded file failed its SHA-256 check.'
+    }
+
+    $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Path-to-Link'
+    New-Item -ItemType Directory -Path $installDir -Force | Out-Null
+    $executablePath = Join-Path $installDir 'path-to-link.exe'
+    Copy-Item -LiteralPath $downloadPath -Destination $executablePath -Force
+
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $pathEntries = @($userPath -split ';' | Where-Object { $_ })
+    if ($pathEntries -notcontains $installDir) {
+        $updatedPath = (@($pathEntries) + $installDir) -join ';'
+        [Environment]::SetEnvironmentVariable('Path', $updatedPath, 'User')
+    }
+
+    if (($env:Path -split ';') -notcontains $installDir) {
+        $env:Path = "$installDir;$env:Path"
+    }
+
+    Write-Host "Installed Path-to-Link to $installDir"
+    Write-Host 'Run: path-to-link --help'
+    & $executablePath --version
+} finally {
+    Remove-Item -LiteralPath $tempDir -Recurse -Force
+}
