@@ -121,6 +121,9 @@ jobs:
     permissions:
       contents: write
     steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e9fe4098bad09cb42c3dec7187f15861fc # v7.0.1
+
       - name: Download platform builds
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
