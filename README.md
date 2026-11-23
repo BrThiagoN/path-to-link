@@ -10,7 +10,7 @@ Share an approved file with a local tool or AI agent over HTTP — without uploa
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux-7c3aed)](#installation)
 
-[Installation](#installation) · [Quick start](#quick-start) · [MCP](#mcp-setup) · [Security](#security) · [Development](#development)
+[Installation](#installation) · [Quick start](#quick-start) · [Commands](docs/commands.md) · [MCP](#mcp-setup) · [Security](#security) · [Development](#development)
 
 </div>
 
@@ -89,9 +89,7 @@ ptl close "C:/Users/you/Shared/example.pdf"
 ptl close all
 ```
 
-`ptl run` picks an available port on `127.0.0.1`. Each file has one active link at a time. Running the same path again reuses its link and renews its lifetime. The default is 15 minutes. Pass `--expires-in <seconds>` with the file path to set a different lifetime. `ptl close all` stops the background server and invalidates its links. For a file literally named `all`, use `ptl close ./all`.
-
-Run `ptl change port` to move the running server to another available loopback port. Active shares keep their expiry times. Their URLs use the new port, so run `ptl status` to copy the updated links and replace any old URLs you shared.
+`ptl run` picks an available port on `127.0.0.1`. Each file gets one active link that lasts 15 minutes by default. See the [command reference](docs/commands.md) for custom expiry times, port changes, and more examples.
 
 If you used the previous standalone commands, `ptl run [file]` replaces `serve`, `share`, and `token`. Use `ptl status` in place of `list` and `ptl close <file>` in place of `revoke`. The installed command for source builds is now `ptl`.
 
