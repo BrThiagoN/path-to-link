@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -13,12 +13,16 @@ use tower_http::services::ServeFile;
 
 use crate::{AppState, CreateShareRequest};
 
-pub fn router(state: AppState) -> Router {
+pub fn router(state: AppState, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/f/{id}", get(serve_file).head(serve_file))
+        .route("/api/roots", post(add_root))
         .route("/api/shares", post(create_share).get(list_shares))
+        .route("/api/shares/by-path", delete(revoke_share_by_path))
         .route("/api/shares/{id}", delete(revoke_share))
+        .route("/api/shutdown", post(shutdown))
+        .layer(Extension(shutdown_tx))
         .with_state(state)
 }
 
@@ -36,6 +40,28 @@ async fn create_share(
     }
     match state.create_share(request).await {
         Ok(share) => (StatusCode::CREATED, Json(share)).into_response(),
+        Err(message) => error(StatusCode::UNPROCESSABLE_ENTITY, &message),
+    }
+}
+
+#[derive(Deserialize)]
+struct AddRootRequest {
+    path: String,
+}
+
+async fn add_root(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<AddRootRequest>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+    match state
+        .add_allowed_root(std::path::Path::new(&request.path))
+        .await
+    {
+        Ok(path) => (StatusCode::CREATED, Json(json!({ "path": path }))).into_response(),
         Err(message) => error(StatusCode::UNPROCESSABLE_ENTITY, &message),
     }
 }
@@ -60,6 +86,41 @@ async fn revoke_share(
     } else {
         error(StatusCode::NOT_FOUND, "share was not found or has expired")
     }
+}
+
+#[derive(Deserialize)]
+struct RevokeByPathRequest {
+    path: String,
+}
+
+async fn revoke_share_by_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevokeByPathRequest>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+    if state
+        .revoke_share_by_path(std::path::Path::new(&request.path))
+        .await
+    {
+        Json(json!({ "revoked": true, "path": request.path })).into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "share for this path was not found")
+    }
+}
+
+async fn shutdown(
+    State(state): State<AppState>,
+    Extension(shutdown_tx): Extension<tokio::sync::watch::Sender<bool>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+    let _ = shutdown_tx.send(true);
+    Json(json!({ "stopping": true })).into_response()
 }
 
 #[derive(Deserialize)]

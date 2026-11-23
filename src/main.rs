@@ -1,21 +1,32 @@
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    env, fs,
+    net::SocketAddr,
+    path::PathBuf,
+    process::{Command as ProcessCommand, Stdio},
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use path_to_link::{
-    AppState, ShareInfo, canonicalize_roots, generate_secret, http_api, mcp_api::PathToLinkMcp,
-    valid_control_token,
+    AppState, CreateShareRequest, ShareInfo, canonicalize_roots, generate_secret, http_api,
+    mcp_api::PathToLinkMcp, valid_control_token,
 };
 use reqwest::Client;
 use rmcp::{ServiceExt, transport::stdio};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
+const LOCAL_SERVER_ADDRESS: &str = "127.0.0.1:38751";
+const LOCAL_SERVER_URL: &str = "http://127.0.0.1:38751";
+const CONTROL_TOKEN_ENV: &str = "PATH_TO_LINK_CONTROL_TOKEN";
+const DEFAULT_EXPIRATION_SECONDS: u64 = 900;
+
 #[derive(Debug, Parser)]
-#[command(name = "path-to-link", version, about)]
+#[command(name = "ptl", version, about = "Share temporary links to local files")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -23,34 +34,29 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the authenticated HTTP service for CLI-managed shares.
-    Serve(ServerArgs),
-    /// Run MCP over stdio and start a local HTTP listener for its share links.
+    /// Start the local server, optionally sharing a file.
+    Run(RunArgs),
+    /// Revoke a file link or stop the local server.
+    Close(CloseArgs),
+    /// Show the local server and its active links.
+    Status,
+    /// Run the MCP server for an MCP client configuration.
     Mcp(McpArgs),
-    /// Create a share through a running `serve` process.
-    Share(ShareArgs),
-    /// List shares from a running `serve` process.
-    List(ServerClientArgs),
-    /// Revoke a share from a running `serve` process.
-    Revoke(RevokeArgs),
-    /// Generate a high-entropy control token for the HTTP management API.
-    Token,
+    /// Internal process used to run the local server in the background.
+    #[command(name = "__serve", hide = true)]
+    InternalServe,
 }
 
 #[derive(Debug, Args)]
-struct ServerArgs {
-    /// Address to bind. Keep this on 127.0.0.1 unless LAN access is needed.
-    #[arg(long, default_value = "127.0.0.1:38751")]
-    bind: SocketAddr,
-    /// A directory whose files may be shared. May be specified more than once.
-    #[arg(long = "allow-root", required = true)]
-    allowed_roots: Vec<PathBuf>,
-    /// Control API bearer token; set PATH_TO_LINK_CONTROL_TOKEN instead of a CLI argument.
-    #[arg(long, env = "PATH_TO_LINK_CONTROL_TOKEN")]
-    control_token: Option<String>,
-    /// Base URL clients use to reach this server. Required for non-loopback binds.
-    #[arg(long)]
-    public_base_url: Option<String>,
+struct RunArgs {
+    /// File to share after starting the local server.
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct CloseArgs {
+    /// File path to revoke, or `all` to stop the local server.
+    path: String,
 }
 
 #[derive(Debug, Args)]
@@ -66,43 +72,30 @@ struct McpArgs {
     public_base_url: Option<String>,
 }
 
-#[derive(Debug, Args)]
-struct ServerClientArgs {
-    /// URL of a running `serve` process.
-    #[arg(
-        long,
-        env = "PATH_TO_LINK_URL",
-        default_value = "http://127.0.0.1:38751"
-    )]
-    server_url: String,
-    /// Control API token; set PATH_TO_LINK_CONTROL_TOKEN instead of a CLI argument.
-    #[arg(long, env = "PATH_TO_LINK_CONTROL_TOKEN")]
-    control_token: Option<String>,
+#[derive(Debug, Serialize, Deserialize)]
+struct DaemonConfig {
+    control_token: String,
 }
 
-#[derive(Debug, Args)]
-struct ShareArgs {
-    /// Absolute path of the file to share.
-    path: PathBuf,
-    /// Link lifetime in seconds (1 to 86400).
-    #[arg(long, default_value_t = 900)]
-    expires_in: u64,
-    #[command(flatten)]
-    server: ServerClientArgs,
+#[derive(Debug, Deserialize)]
+struct HealthResponse {
+    status: String,
+    service: String,
 }
 
-#[derive(Debug, Args)]
-struct RevokeArgs {
-    /// ID returned when the share was created.
-    id: String,
-    #[command(flatten)]
-    server: ServerClientArgs,
+#[derive(Debug, Deserialize)]
+struct SharesResponse {
+    shares: Vec<ShareInfo>,
 }
 
-#[derive(Serialize)]
-struct CliCreateShare {
+#[derive(Debug, Serialize)]
+struct AddRootRequest {
     path: String,
-    expires_in: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RevokeByPathRequest {
+    path: String,
 }
 
 #[tokio::main]
@@ -116,40 +109,333 @@ async fn main() -> Result<()> {
         .init();
 
     match Cli::parse().command {
-        Command::Serve(args) => {
-            run_http_server(
-                args.bind,
-                args.allowed_roots,
-                args.public_base_url,
-                require_control_token(args.control_token)?,
-            )
-            .await
-        }
+        Command::Run(args) => run_command(args).await,
+        Command::Close(args) => close_command(args).await,
+        Command::Status => status_command().await,
         Command::Mcp(args) => run_mcp(args).await,
-        Command::Share(args) => create_share_via_api(args).await,
-        Command::List(args) => list_shares_via_api(args).await,
-        Command::Revoke(args) => revoke_via_api(args).await,
-        Command::Token => {
-            println!("{}", generate_secret());
-            Ok(())
+        Command::InternalServe => run_managed_server().await,
+    }
+}
+
+async fn run_command(args: RunArgs) -> Result<()> {
+    let Some(path) = args.path else {
+        ensure_local_server().await?;
+        println!("Path-to-Link está rodando em {LOCAL_SERVER_URL}");
+        return Ok(());
+    };
+
+    let canonical_path = tokio::fs::canonicalize(&path)
+        .await
+        .with_context(|| format!("não foi possível acessar o arquivo: {}", path.display()))?;
+    let metadata = tokio::fs::metadata(&canonical_path).await?;
+    if !metadata.is_file() {
+        bail!(
+            "o caminho precisa apontar para um arquivo: {}",
+            path.display()
+        );
+    }
+    let parent = canonical_path
+        .parent()
+        .context("não foi possível determinar a pasta do arquivo")?;
+    let api = ensure_local_server().await?;
+
+    api.client
+        .post(format!("{}/api/roots", api.base_url))
+        .bearer_auth(&api.control_token)
+        .json(&AddRootRequest {
+            path: parent.to_string_lossy().into_owned(),
+        })
+        .send()
+        .await
+        .context("não foi possível autorizar a pasta local")?
+        .error_for_status()
+        .context("o servidor recusou a pasta do arquivo")?;
+
+    let response = api
+        .client
+        .post(format!("{}/api/shares", api.base_url))
+        .bearer_auth(&api.control_token)
+        .json(&CreateShareRequest {
+            path: canonical_path.to_string_lossy().into_owned(),
+            expires_in: Some(DEFAULT_EXPIRATION_SECONDS),
+        })
+        .send()
+        .await
+        .context("não foi possível criar o link")?;
+    let share: ShareInfo = response
+        .error_for_status()
+        .context("o servidor recusou o compartilhamento")?
+        .json()
+        .await
+        .context("o servidor retornou uma resposta inválida")?;
+    println!("{}", share.url);
+    println!("Válido por {} segundos", share.expires_in_seconds);
+    Ok(())
+}
+
+async fn close_command(args: CloseArgs) -> Result<()> {
+    if args.path.eq_ignore_ascii_case("all") {
+        return close_all().await;
+    }
+
+    let path = PathBuf::from(args.path);
+    let canonical_path = tokio::fs::canonicalize(&path)
+        .await
+        .with_context(|| format!("não foi possível acessar o caminho: {}", path.display()))?;
+    let Some(api) = connected_local_server().await? else {
+        println!("Path-to-Link não está rodando.");
+        return Ok(());
+    };
+
+    let response = api
+        .client
+        .delete(format!("{}/api/shares/by-path", api.base_url))
+        .bearer_auth(&api.control_token)
+        .json(&RevokeByPathRequest {
+            path: canonical_path.to_string_lossy().into_owned(),
+        })
+        .send()
+        .await
+        .context("não foi possível revogar o link")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        println!("Não há link ativo para {}", canonical_path.display());
+        return Ok(());
+    }
+    response
+        .error_for_status()
+        .context("o servidor recusou a revogação")?;
+    println!("Link revogado: {}", canonical_path.display());
+    Ok(())
+}
+
+async fn close_all() -> Result<()> {
+    let Some(api) = connected_local_server().await? else {
+        clear_daemon_config()?;
+        println!("Path-to-Link não está rodando.");
+        return Ok(());
+    };
+    api.client
+        .post(format!("{}/api/shutdown", api.base_url))
+        .bearer_auth(&api.control_token)
+        .send()
+        .await
+        .context("não foi possível encerrar o servidor local")?
+        .error_for_status()
+        .context("o servidor recusou o encerramento")?;
+    clear_daemon_config()?;
+    println!("Path-to-Link foi encerrado. Todos os links foram invalidados.");
+    Ok(())
+}
+
+async fn status_command() -> Result<()> {
+    let Some(api) = connected_local_server().await? else {
+        println!("Path-to-Link não está rodando.");
+        return Ok(());
+    };
+    let response = api
+        .client
+        .get(format!("{}/api/shares", api.base_url))
+        .bearer_auth(&api.control_token)
+        .send()
+        .await
+        .context("não foi possível consultar os links")?
+        .error_for_status()
+        .context("o servidor recusou a consulta")?;
+    let shares: SharesResponse = response.json().await?;
+
+    println!("Path-to-Link está rodando em {LOCAL_SERVER_URL}");
+    if shares.shares.is_empty() {
+        println!("Nenhum link ativo.");
+        return Ok(());
+    }
+    for share in shares.shares {
+        println!("\n{}", share.path);
+        println!("  {}", share.url);
+        println!("  expira em {} segundos", share.expires_in_seconds);
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct LocalApi {
+    client: Client,
+    base_url: String,
+    control_token: String,
+}
+
+async fn ensure_local_server() -> Result<LocalApi> {
+    let client = create_http_client()?;
+    if let Some(config) = read_daemon_config()? {
+        let api = local_api(client.clone(), config.control_token);
+        if server_is_usable(&client, &api.control_token).await {
+            return Ok(api);
+        }
+    }
+
+    let control_token = generate_secret();
+    save_daemon_config(&DaemonConfig {
+        control_token: control_token.clone(),
+    })?;
+
+    let executable = env::current_exe().context("não foi possível localizar o executável ptl")?;
+    let mut command = ProcessCommand::new(executable);
+    command
+        .arg("__serve")
+        .env(CONTROL_TOKEN_ENV, &control_token)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        command.creation_flags(DETACHED_PROCESS);
+    }
+    command
+        .spawn()
+        .context("não foi possível iniciar o servidor em segundo plano")?;
+
+    for _ in 0..50 {
+        if server_is_healthy(&client).await {
+            return Ok(local_api(client, control_token));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    clear_daemon_config()?;
+    bail!("o servidor não iniciou em {LOCAL_SERVER_URL}; verifique se a porta 38751 está livre")
+}
+
+async fn connected_local_server() -> Result<Option<LocalApi>> {
+    let Some(config) = read_daemon_config()? else {
+        return Ok(None);
+    };
+    let client = create_http_client()?;
+    if !server_is_usable(&client, &config.control_token).await {
+        clear_daemon_config()?;
+        return Ok(None);
+    }
+    Ok(Some(local_api(client, config.control_token)))
+}
+
+fn local_api(client: Client, control_token: String) -> LocalApi {
+    LocalApi {
+        client,
+        base_url: LOCAL_SERVER_URL.to_string(),
+        control_token,
+    }
+}
+
+fn create_http_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("não foi possível criar o cliente HTTP")
+}
+
+async fn server_is_healthy(client: &Client) -> bool {
+    let Ok(response) = client
+        .get(format!("{LOCAL_SERVER_URL}/health"))
+        .send()
+        .await
+    else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    response
+        .json::<HealthResponse>()
+        .await
+        .is_ok_and(|health| health.status == "ok" && health.service == "path-to-link")
+}
+
+async fn server_is_usable(client: &Client, control_token: &str) -> bool {
+    if !server_is_healthy(client).await {
+        return false;
+    }
+    client
+        .get(format!("{LOCAL_SERVER_URL}/api/shares"))
+        .bearer_auth(control_token)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success())
+}
+
+fn daemon_config_path() -> Result<PathBuf> {
+    #[cfg(windows)]
+    let base = env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .context("LOCALAPPDATA não está definido")?;
+    #[cfg(not(windows))]
+    let base = env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
+        .context("não foi possível localizar a pasta de estado do usuário")?;
+    Ok(base.join("path-to-link").join("daemon.json"))
+}
+
+fn read_daemon_config() -> Result<Option<DaemonConfig>> {
+    let path = daemon_config_path()?;
+    match fs::read(&path) {
+        Ok(contents) => Ok(Some(
+            serde_json::from_slice(&contents).context("arquivo de estado local inválido")?,
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => {
+            Err(error).with_context(|| format!("não foi possível ler {}", path.display()))
         }
     }
 }
 
-async fn run_http_server(
-    bind: SocketAddr,
-    allowed_roots: Vec<PathBuf>,
-    public_base_url: Option<String>,
-    control_token: String,
-) -> Result<()> {
-    let listener = TcpListener::bind(bind)
+fn save_daemon_config(config: &DaemonConfig) -> Result<()> {
+    let path = daemon_config_path()?;
+    let parent = path.parent().context("caminho de estado inválido")?;
+    fs::create_dir_all(parent)
+        .with_context(|| format!("não foi possível criar {}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let contents = serde_json::to_vec(config)?;
+    fs::write(&path, contents)
+        .with_context(|| format!("não foi possível gravar {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+fn clear_daemon_config() -> Result<()> {
+    let path = daemon_config_path()?;
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("não foi possível remover {}", path.display()))
+        }
+    }
+}
+
+async fn run_managed_server() -> Result<()> {
+    let token = env::var(CONTROL_TOKEN_ENV).context("token interno do servidor ausente")?;
+    if !valid_control_token(&token) {
+        bail!("token interno do servidor inválido");
+    }
+    let address: SocketAddr = LOCAL_SERVER_ADDRESS.parse()?;
+    let listener = TcpListener::bind(address)
         .await
-        .with_context(|| format!("could not bind to {bind}"))?;
-    let address = listener.local_addr()?;
-    let roots = canonicalize_roots(&allowed_roots).map_err(anyhow::Error::msg)?;
-    let base_url = resolve_base_url(address, public_base_url.as_deref())?;
-    let state = AppState::new(roots, base_url.clone(), &control_token);
-    tracing::info!(%address, base_url = %base_url, "Path-to-Link HTTP server started");
+        .with_context(|| format!("não foi possível abrir {LOCAL_SERVER_URL}"))?;
+    let base_url = Url::parse(&format!("http://{address}/"))?;
+    let state = AppState::new(Vec::new(), base_url, &token);
+    tracing::info!(%address, "Path-to-Link local server started");
     run_server(listener, state).await
 }
 
@@ -185,7 +471,8 @@ async fn run_mcp(args: McpArgs) -> Result<()> {
 
 async fn run_server(listener: TcpListener, state: AppState) -> Result<()> {
     let cleanup_state = state.clone();
-    let router: Router = http_api::router(state);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    let router: Router = http_api::router(state, shutdown_tx);
     let cleanup_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -196,8 +483,11 @@ async fn run_server(listener: TcpListener, state: AppState) -> Result<()> {
             }
         }
     });
-    let shutdown = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let shutdown = async move {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {},
+            _ = tokio::signal::ctrl_c() => {},
+        }
     };
     let result = axum::serve(listener, router)
         .with_graceful_shutdown(shutdown)
@@ -227,93 +517,4 @@ fn resolve_base_url(address: SocketAddr, configured: Option<&str>) -> Result<Url
         bail!("--public-base-url is required when binding outside loopback");
     };
     Ok(base_url)
-}
-
-fn require_control_token(token: Option<String>) -> Result<String> {
-    let token = token.unwrap_or_default();
-    if !valid_control_token(&token) {
-        bail!(
-            "set PATH_TO_LINK_CONTROL_TOKEN to a token with at least 32 characters; `path-to-link token` generates one"
-        );
-    }
-    Ok(token)
-}
-
-fn client_config(args: &ServerClientArgs) -> Result<(Client, String, String)> {
-    let token = require_control_token(args.control_token.clone())?;
-    let mut server_url =
-        Url::parse(&args.server_url).context("--server-url must be an absolute URL")?;
-    if server_url.scheme() != "http"
-        || server_url.host_str().is_none()
-        || server_url.query().is_some()
-        || server_url.fragment().is_some()
-    {
-        bail!("--server-url must be an HTTP origin, such as http://127.0.0.1:38751");
-    }
-    server_url.set_path("");
-    let base = server_url.as_str().trim_end_matches('/').to_string();
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .context("could not create HTTP client")?;
-    Ok((client, base, token))
-}
-
-async fn create_share_via_api(args: ShareArgs) -> Result<()> {
-    let (client, base, token) = client_config(&args.server)?;
-    let request = CliCreateShare {
-        path: args.path.to_string_lossy().into_owned(),
-        expires_in: args.expires_in,
-    };
-    let response = client
-        .post(format!("{base}/api/shares"))
-        .bearer_auth(token)
-        .json(&request)
-        .send()
-        .await
-        .context("could not reach Path-to-Link server")?;
-    let share: ShareInfo = response
-        .error_for_status()
-        .context("server rejected share request")?
-        .json()
-        .await
-        .context("server returned an invalid share response")?;
-    println!("{}", serde_json::to_string_pretty(&share)?);
-    Ok(())
-}
-
-async fn list_shares_via_api(args: ServerClientArgs) -> Result<()> {
-    let (client, base, token) = client_config(&args)?;
-    let response = client
-        .get(format!("{base}/api/shares"))
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("could not reach Path-to-Link server")?;
-    let body: serde_json::Value = response
-        .error_for_status()
-        .context("server rejected list request")?
-        .json()
-        .await
-        .context("server returned invalid JSON")?;
-    println!("{}", serde_json::to_string_pretty(&body)?);
-    Ok(())
-}
-
-async fn revoke_via_api(args: RevokeArgs) -> Result<()> {
-    let (client, base, token) = client_config(&args.server)?;
-    let response = client
-        .delete(format!("{base}/api/shares/{}", args.id))
-        .bearer_auth(token)
-        .send()
-        .await
-        .context("could not reach Path-to-Link server")?;
-    let body: serde_json::Value = response
-        .error_for_status()
-        .context("server rejected revoke request")?
-        .json()
-        .await
-        .context("server returned invalid JSON")?;
-    println!("{}", serde_json::to_string_pretty(&body)?);
-    Ok(())
 }

@@ -43,7 +43,7 @@ impl PathToLinkMcp {
 #[tool_router]
 impl PathToLinkMcp {
     #[tool(
-        description = "Create a temporary HTTP link for an allowed local file. Each call creates an independent link, so multiple links can remain active simultaneously. The returned URL includes a per-share access token; do not publish it."
+        description = "Create or refresh the single temporary HTTP link for an allowed local file. Repeated calls for the same canonical path reuse the link and renew its lifetime. The returned URL includes an access token; treat it as a secret."
     )]
     async fn share_file(
         &self,
