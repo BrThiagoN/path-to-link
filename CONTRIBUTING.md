@@ -14,8 +14,8 @@ Build a local Rust service that exposes approved local files through temporary H
 
 ## Security and lifecycle
 
-- Require at least one configured allowed root. Canonicalize roots and requested paths; reject non-files and paths outside every allowed root. This must reject symlink targets outside the allowlist.
-- Store each share as an independent registry entry. Multiple links must stay active concurrently.
+- Require explicit allowed roots in MCP mode. In CLI mode, grant a link to the requested file. Canonicalize paths and check them again when serving files to prevent a symlink redirect outside the authorized scope.
+- Keep one active link per canonical path. Multiple distinct paths can stay active concurrently.
 - Give each share an unpredictable ID and a separate access token. Never log access tokens.
 - Validate expiry when serving a request, and also clean expired records in the background. Revocation must take effect immediately.
 - Protect management operations with a control token. A non-loopback bind requires an explicit advertised base URL and secure credentials.
@@ -26,4 +26,4 @@ Build a local Rust service that exposes approved local files through temporary H
 
 - `.agents/` is intentionally ignored by Git and may contain machine-local agent notes. Read files there when present, but do not add them to commits.
 - No existing `.agents/` instructions were present when this project was initialized.
-- Prefer `cargo fmt` and `cargo check` during implementation. Do not run the test suite unless requested.
+- Prefer `cargo fmt` and `cargo check` during implementation. Pull requests targeting `main` run the test suite on Windows and Linux.

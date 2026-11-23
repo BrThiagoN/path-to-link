@@ -16,18 +16,18 @@ Share an approved file with a local tool or AI agent over HTTP — without uploa
 
 ---
 
-Path-to-Link serves files directly from your machine. You choose which folders are allowed, each link gets a private token and an expiry time, and you can revoke it whenever you want.
+Path-to-Link serves files directly from your machine. Select files in the CLI or configure allowed folders for MCP. Each link gets a private token and an expiry time, and you can revoke it whenever you want.
 
 ## ✨ What it does
 
 | | |
 |---|---|
-| 📁 **Folder allowlist** | Shares only files inside roots you explicitly approve. |
+| 📁 **Folder allowlist** | Limits MCP sharing to roots you explicitly approve. |
 | ⏱️ **Temporary links** | Links expire automatically; the default is 15 minutes. |
 | 🔐 **Private access tokens** | Every link has its own high-entropy token. |
 | 🚫 **Instant revocation** | Revoke a link at any time. |
 | 🖥️ **Local by default** | The HTTP server binds to loopback unless you choose another interface. |
-| 🤖 **MCP and CLI** | Use it from an MCP client or manage a standalone server from your terminal. |
+| 🤖 **MCP and CLI** | Share files from an MCP client or from your terminal with `ptl`. |
 
 ## Installation
 
@@ -89,7 +89,9 @@ ptl close "C:/Users/you/Shared/example.pdf"
 ptl close all
 ```
 
-`ptl run` binds to `127.0.0.1:38751`. Each file has one active link at a time. Running the same path again reuses its link and renews its 15-minute lifetime. `ptl close all` stops the background server, which invalidates every active link.
+`ptl run` picks an available port on `127.0.0.1`. Each file has one active link at a time. Running the same path again reuses its link and renews its lifetime. The default is 15 minutes. Pass `--expires-in <seconds>` with the file path to set a different lifetime. `ptl close all` stops the background server and invalidates its links. For a file literally named `all`, use `ptl close ./all`.
+
+If you used the previous standalone commands, `ptl run [file]` replaces `serve`, `share`, and `token`. Use `ptl status` in place of `list` and `ptl close <file>` in place of `revoke`. The installed command for source builds is now `ptl`.
 
 ## MCP setup
 
@@ -134,7 +136,8 @@ The client and the file-consuming tool must be able to reach the same machine an
 
 ## Security
 
-- The `ptl` commands bind the background server to `127.0.0.1`; each `ptl run <file>` authorizes that file's parent folder for local link creation.
+- The CLI shares only the specific file requested with `ptl run <file>`. Other files in the same folder need their own share requests.
+- The CLI stores the local control token and selected port in `%LOCALAPPDATA%\path-to-link\daemon.json` on Windows or `${XDG_STATE_HOME:-$HOME/.local/state}/path-to-link/daemon.json` on macOS and Linux. Keep this file private while the server is running. If the token no longer matches, restore the matching state file or stop the background `ptl` process before restarting.
 - MCP mode shares only files below folders explicitly passed with `--allow-root`. Path-to-Link resolves paths before checking them.
 - The server binds to `127.0.0.1` by default. A non-loopback bind requires an explicit `--public-base-url`.
 - A share URL contains its own access token. Anyone with the full URL can fetch that file until the link expires or is revoked. Treat the URL as a secret.
