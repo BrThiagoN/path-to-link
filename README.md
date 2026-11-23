@@ -62,23 +62,41 @@ cargo install --git https://github.com/BrThiagoN/path-to-link
 Check that it is ready:
 
 ```sh
-path-to-link --help
+ptl help
 ```
 
 > **No release available yet?** The installers download the latest published release. Until the first release is created, install from source or build locally with `cargo build --release`.
 
 ## Quick start
 
-Start the MCP server and allow it to share files from one folder:
+Start the local server in the background:
 
 ```sh
-path-to-link mcp --allow-root "/path/to/shared-files"
+ptl run
 ```
 
-For example, on Windows:
+Create a temporary link for a file (the server starts automatically if needed):
 
 ```powershell
-path-to-link mcp --allow-root "C:/Users/you/Shared"
+ptl run "C:/Users/you/Shared/example.pdf"
+```
+
+List links, revoke one file's link, or stop the server and invalidate all links:
+
+```powershell
+ptl status
+ptl close "C:/Users/you/Shared/example.pdf"
+ptl close all
+```
+
+`ptl run` binds to `127.0.0.1:38751`. Each file has one active link at a time. Running the same path again reuses its link and renews its 15-minute lifetime. `ptl close all` stops the background server, which invalidates every active link.
+
+## MCP setup
+
+For MCP clients, start Path-to-Link over stdio and allow a folder:
+
+```sh
+ptl mcp --allow-root "/path/to/shared-files"
 ```
 
 The MCP server starts an HTTP listener on an available loopback port and exposes three tools:
@@ -89,17 +107,17 @@ The MCP server starts an HTTP listener on an available loopback port and exposes
 | `list_shares` | See active links and their remaining lifetime. |
 | `revoke_share` | Disable a link immediately. |
 
-Each share is independent, so you can keep several links active at once. The default lifetime is 900 seconds; the maximum is 86,400 seconds.
+Each canonical file path has one active link. Repeated calls for that path reuse the link and renew its lifetime. The default lifetime is 900 seconds; the maximum is 86,400 seconds.
 
-## MCP setup
+## Connect an MCP client
 
 Add Path-to-Link to your MCP client's configuration. Replace the example path with a folder on your machine:
 
 ```json
 {
   "mcpServers": {
-    "path-to-link": {
-      "command": "path-to-link",
+    "ptl": {
+      "command": "ptl",
       "args": [
         "mcp",
         "--allow-root",
@@ -110,35 +128,14 @@ Add Path-to-Link to your MCP client's configuration. Replace the example path wi
 }
 ```
 
-The exact configuration file varies by MCP client. If the client cannot find `path-to-link`, use the full path to the installed executable.
+The exact configuration file varies by MCP client. If the client cannot find `ptl`, use the full path to the installed executable.
 
 The client and the file-consuming tool must be able to reach the same machine and network namespace. The default `127.0.0.1` address works when both run on the same host.
 
-## Standalone HTTP server
-
-Use standalone mode when you want a long-running HTTP server and CLI commands that manage it.
-
-Start the server in one terminal:
-
-```powershell
-$env:PATH_TO_LINK_CONTROL_TOKEN = (& path-to-link token)
-path-to-link serve --allow-root "C:/Users/you/Shared"
-```
-
-Then create and manage links from another terminal:
-
-```powershell
-$env:PATH_TO_LINK_CONTROL_TOKEN = "paste-the-same-token-here"
-path-to-link share "C:/Users/you/Shared/example.pdf" --expires-in 3600
-path-to-link list
-path-to-link revoke <share-id>
-```
-
-Keep the control token in an environment variable. Do not place it directly in a command that may be saved in shell history.
-
 ## Security
 
-- Only files below a configured `--allow-root` can be shared. Path-to-Link resolves paths before checking them.
+- The `ptl` commands bind the background server to `127.0.0.1`; each `ptl run <file>` authorizes that file's parent folder for local link creation.
+- MCP mode shares only files below folders explicitly passed with `--allow-root`. Path-to-Link resolves paths before checking them.
 - The server binds to `127.0.0.1` by default. A non-loopback bind requires an explicit `--public-base-url`.
 - A share URL contains its own access token. Anyone with the full URL can fetch that file until the link expires or is revoked. Treat the URL as a secret.
 - Files are streamed from disk on demand; they are not copied into Path-to-Link or uploaded by the server.

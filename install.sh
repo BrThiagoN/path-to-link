@@ -51,8 +51,9 @@ if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
 fi
 
 mkdir -p "$install_dir"
+cp "$temp_dir/$asset_name" "$install_dir/ptl"
 cp "$temp_dir/$asset_name" "$install_dir/path-to-link"
-chmod 755 "$install_dir/path-to-link"
+chmod 755 "$install_dir/ptl" "$install_dir/path-to-link"
 
 shell_path=$(printenv SHELL 2>/dev/null || printf 'sh')
 shell_name=$(basename "$shell_path")
@@ -79,6 +80,6 @@ if [ "$shell_name" != 'fish' ] && ! grep -Fq '.local/bin' "$profile_file" 2>/dev
     printf '\n# Path-to-Link\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$profile_file"
 fi
 
-printf 'Installed Path-to-Link to %s/path-to-link\n' "$install_dir"
+printf 'Installed Path-to-Link to %s/ptl\n' "$install_dir"
 printf 'Added ~/.local/bin to %s if it was not already present.\n' "$profile_file"
-printf 'Open a new terminal, then run: path-to-link --help\n'
+printf 'Open a new terminal, then run: ptl help\n'
