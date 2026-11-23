@@ -95,7 +95,7 @@ impl ServerHandler for PathToLinkMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Create temporary HTTP URLs for files under explicitly configured local roots. Links are independent, expire automatically, and can be revoked. The HTTP server runs on the local machine alongside this MCP stdio process.",
+                "Create temporary HTTP URLs for files under explicitly configured local roots. Sharing a path again renews its active link. Links expire automatically and can be revoked. The HTTP server runs alongside this MCP stdio process.",
             )
     }
 }

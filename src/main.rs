@@ -1,29 +1,19 @@
-use std::{
-    env, fs,
-    net::SocketAddr,
-    path::PathBuf,
-    process::{Command as ProcessCommand, Stdio},
-    time::Duration,
-};
+mod daemon;
+
+use std::{net::SocketAddr, path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use clap::{Args, Parser, Subcommand};
 use path_to_link::{
     AppState, CreateShareRequest, ShareInfo, canonicalize_roots, generate_secret, http_api,
-    mcp_api::PathToLinkMcp, valid_control_token,
+    mcp_api::PathToLinkMcp,
 };
-use reqwest::Client;
 use rmcp::{ServiceExt, transport::stdio};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 use url::Url;
-
-const LOCAL_SERVER_ADDRESS: &str = "127.0.0.1:38751";
-const LOCAL_SERVER_URL: &str = "http://127.0.0.1:38751";
-const CONTROL_TOKEN_ENV: &str = "PATH_TO_LINK_CONTROL_TOKEN";
-const DEFAULT_EXPIRATION_SECONDS: u64 = 900;
 
 #[derive(Debug, Parser)]
 #[command(name = "ptl", version, about = "Share temporary links to local files")]
@@ -51,12 +41,15 @@ enum Command {
 struct RunArgs {
     /// File to share after starting the local server.
     path: Option<PathBuf>,
+    /// Link lifetime in seconds (defaults to 900).
+    #[arg(long, requires = "path", value_parser = clap::value_parser!(u64).range(1..=path_to_link::MAX_EXPIRATION_SECONDS))]
+    expires_in: Option<u64>,
 }
 
 #[derive(Debug, Args)]
 struct CloseArgs {
     /// File path to revoke, or `all` to stop the local server.
-    path: String,
+    path: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -72,25 +65,9 @@ struct McpArgs {
     public_base_url: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct DaemonConfig {
-    control_token: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct HealthResponse {
-    status: String,
-    service: String,
-}
-
 #[derive(Debug, Deserialize)]
 struct SharesResponse {
     shares: Vec<ShareInfo>,
-}
-
-#[derive(Debug, Serialize)]
-struct AddRootRequest {
-    path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,330 +90,149 @@ async fn main() -> Result<()> {
         Command::Close(args) => close_command(args).await,
         Command::Status => status_command().await,
         Command::Mcp(args) => run_mcp(args).await,
-        Command::InternalServe => run_managed_server().await,
+        Command::InternalServe => daemon::serve().await,
     }
 }
 
 async fn run_command(args: RunArgs) -> Result<()> {
-    let Some(path) = args.path else {
-        ensure_local_server().await?;
-        println!("Path-to-Link está rodando em {LOCAL_SERVER_URL}");
+    let path = match args.path {
+        Some(path) => {
+            let path = tokio::fs::canonicalize(&path)
+                .await
+                .with_context(|| format!("Could not access {}", path.display()))?;
+            if !tokio::fs::metadata(&path).await?.is_file() {
+                bail!("Expected a file: {}", path.display());
+            }
+            Some(path)
+        }
+        None => None,
+    };
+    let api = daemon::connect(true)
+        .await?
+        .context("Local server did not start")?;
+    let Some(path) = path else {
+        println!("Path-to-Link is running at {}", api.base_url);
         return Ok(());
     };
-
-    let canonical_path = tokio::fs::canonicalize(&path)
-        .await
-        .with_context(|| format!("não foi possível acessar o arquivo: {}", path.display()))?;
-    let metadata = tokio::fs::metadata(&canonical_path).await?;
-    if !metadata.is_file() {
-        bail!(
-            "o caminho precisa apontar para um arquivo: {}",
-            path.display()
-        );
+    if api.legacy {
+        bail!("Run `ptl close all` to stop the previous version, then retry sharing the file.");
     }
-    let parent = canonical_path
-        .parent()
-        .context("não foi possível determinar a pasta do arquivo")?;
-    let api = ensure_local_server().await?;
 
-    api.client
-        .post(format!("{}/api/roots", api.base_url))
-        .bearer_auth(&api.control_token)
-        .json(&AddRootRequest {
-            path: parent.to_string_lossy().into_owned(),
-        })
-        .send()
-        .await
-        .context("não foi possível autorizar a pasta local")?
-        .error_for_status()
-        .context("o servidor recusou a pasta do arquivo")?;
-
-    let response = api
+    let share: ShareInfo = api
         .client
         .post(format!("{}/api/shares", api.base_url))
         .bearer_auth(&api.control_token)
         .json(&CreateShareRequest {
-            path: canonical_path.to_string_lossy().into_owned(),
-            expires_in: Some(DEFAULT_EXPIRATION_SECONDS),
+            path: path
+                .into_os_string()
+                .into_string()
+                .map_err(|_| anyhow::anyhow!("The file path is not valid UTF-8"))?,
+            expires_in: args.expires_in,
         })
         .send()
         .await
-        .context("não foi possível criar o link")?;
-    let share: ShareInfo = response
+        .context("Could not create a link")?
         .error_for_status()
-        .context("o servidor recusou o compartilhamento")?
+        .context("The server rejected the share")?
         .json()
         .await
-        .context("o servidor retornou uma resposta inválida")?;
+        .context("Invalid share response")?;
     println!("{}", share.url);
-    println!("Válido por {} segundos", share.expires_in_seconds);
+    println!("Valid for {} seconds", share.expires_in_seconds);
     Ok(())
 }
 
 async fn close_command(args: CloseArgs) -> Result<()> {
-    if args.path.eq_ignore_ascii_case("all") {
-        return close_all().await;
-    }
-
-    let path = PathBuf::from(args.path);
-    let canonical_path = tokio::fs::canonicalize(&path)
-        .await
-        .with_context(|| format!("não foi possível acessar o caminho: {}", path.display()))?;
-    let Some(api) = connected_local_server().await? else {
-        println!("Path-to-Link não está rodando.");
+    let Some(api) = daemon::connect(false).await? else {
+        println!("Path-to-Link is stopped.");
         return Ok(());
     };
+    if args.path.as_os_str() == "all" {
+        api.client
+            .post(format!("{}/api/shutdown", api.base_url))
+            .bearer_auth(&api.control_token)
+            .send()
+            .await
+            .context("Could not stop the local server")?
+            .error_for_status()
+            .context("The server rejected the shutdown request")?;
+        println!(
+            "Path-to-Link is shutting down. Its links are no longer available for new requests."
+        );
+        return Ok(());
+    }
 
+    let mut path = std::path::absolute(args.path)?;
+    if api.legacy {
+        path = path_to_link::canonicalize_for_revoke(&path)
+            .await
+            .unwrap_or(path);
+    }
+    let path = path
+        .into_os_string()
+        .into_string()
+        .map_err(|_| anyhow::anyhow!("The file path is not valid UTF-8"))?;
     let response = api
         .client
         .delete(format!("{}/api/shares/by-path", api.base_url))
         .bearer_auth(&api.control_token)
-        .json(&RevokeByPathRequest {
-            path: canonical_path.to_string_lossy().into_owned(),
-        })
+        .json(&RevokeByPathRequest { path: path.clone() })
         .send()
         .await
-        .context("não foi possível revogar o link")?;
+        .context("Could not revoke the link")?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
-        println!("Não há link ativo para {}", canonical_path.display());
+        println!("No active link for {}", display_path(&path));
         return Ok(());
     }
     response
         .error_for_status()
-        .context("o servidor recusou a revogação")?;
-    println!("Link revogado: {}", canonical_path.display());
-    Ok(())
-}
-
-async fn close_all() -> Result<()> {
-    let Some(api) = connected_local_server().await? else {
-        clear_daemon_config()?;
-        println!("Path-to-Link não está rodando.");
-        return Ok(());
-    };
-    api.client
-        .post(format!("{}/api/shutdown", api.base_url))
-        .bearer_auth(&api.control_token)
-        .send()
-        .await
-        .context("não foi possível encerrar o servidor local")?
-        .error_for_status()
-        .context("o servidor recusou o encerramento")?;
-    clear_daemon_config()?;
-    println!("Path-to-Link foi encerrado. Todos os links foram invalidados.");
+        .context("The server rejected the revocation")?;
+    println!("Link revoked: {}", display_path(&path));
     Ok(())
 }
 
 async fn status_command() -> Result<()> {
-    let Some(api) = connected_local_server().await? else {
-        println!("Path-to-Link não está rodando.");
+    let Some(api) = daemon::connect(false).await? else {
+        println!("Path-to-Link is stopped.");
         return Ok(());
     };
-    let response = api
+    let shares: SharesResponse = api
         .client
         .get(format!("{}/api/shares", api.base_url))
         .bearer_auth(&api.control_token)
         .send()
         .await
-        .context("não foi possível consultar os links")?
+        .context("Could not list links")?
         .error_for_status()
-        .context("o servidor recusou a consulta")?;
-    let shares: SharesResponse = response.json().await?;
+        .context("The server rejected the request")?
+        .json()
+        .await?;
 
-    println!("Path-to-Link está rodando em {LOCAL_SERVER_URL}");
+    println!("Path-to-Link is running at {}", api.base_url);
     if shares.shares.is_empty() {
-        println!("Nenhum link ativo.");
-        return Ok(());
+        println!("No active links.");
     }
     for share in shares.shares {
-        println!("\n{}", share.path);
+        println!("\n{}", display_path(&share.path));
         println!("  {}", share.url);
-        println!("  expira em {} segundos", share.expires_in_seconds);
+        println!("  expires in {} seconds", share.expires_in_seconds);
     }
     Ok(())
 }
 
-#[derive(Clone)]
-struct LocalApi {
-    client: Client,
-    base_url: String,
-    control_token: String,
-}
-
-async fn ensure_local_server() -> Result<LocalApi> {
-    let client = create_http_client()?;
-    if let Some(config) = read_daemon_config()? {
-        let api = local_api(client.clone(), config.control_token);
-        if server_is_usable(&client, &api.control_token).await {
-            return Ok(api);
-        }
-    }
-
-    let control_token = generate_secret();
-    save_daemon_config(&DaemonConfig {
-        control_token: control_token.clone(),
-    })?;
-
-    let executable = env::current_exe().context("não foi possível localizar o executável ptl")?;
-    let mut command = ProcessCommand::new(executable);
-    command
-        .arg("__serve")
-        .env(CONTROL_TOKEN_ENV, &control_token)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
+fn display_path(path: &str) -> std::borrow::Cow<'_, str> {
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        command.creation_flags(DETACHED_PROCESS);
-    }
-    command
-        .spawn()
-        .context("não foi possível iniciar o servidor em segundo plano")?;
-
-    for _ in 0..50 {
-        if server_is_healthy(&client).await {
-            return Ok(local_api(client, control_token));
+        if let Some(path) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{path}").into();
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    clear_daemon_config()?;
-    bail!("o servidor não iniciou em {LOCAL_SERVER_URL}; verifique se a porta 38751 está livre")
-}
-
-async fn connected_local_server() -> Result<Option<LocalApi>> {
-    let Some(config) = read_daemon_config()? else {
-        return Ok(None);
-    };
-    let client = create_http_client()?;
-    if !server_is_usable(&client, &config.control_token).await {
-        clear_daemon_config()?;
-        return Ok(None);
-    }
-    Ok(Some(local_api(client, config.control_token)))
-}
-
-fn local_api(client: Client, control_token: String) -> LocalApi {
-    LocalApi {
-        client,
-        base_url: LOCAL_SERVER_URL.to_string(),
-        control_token,
-    }
-}
-
-fn create_http_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .context("não foi possível criar o cliente HTTP")
-}
-
-async fn server_is_healthy(client: &Client) -> bool {
-    let Ok(response) = client
-        .get(format!("{LOCAL_SERVER_URL}/health"))
-        .send()
-        .await
-    else {
-        return false;
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-    response
-        .json::<HealthResponse>()
-        .await
-        .is_ok_and(|health| health.status == "ok" && health.service == "path-to-link")
-}
-
-async fn server_is_usable(client: &Client, control_token: &str) -> bool {
-    if !server_is_healthy(client).await {
-        return false;
-    }
-    client
-        .get(format!("{LOCAL_SERVER_URL}/api/shares"))
-        .bearer_auth(control_token)
-        .send()
-        .await
-        .is_ok_and(|response| response.status().is_success())
-}
-
-fn daemon_config_path() -> Result<PathBuf> {
-    #[cfg(windows)]
-    let base = env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .context("LOCALAPPDATA não está definido")?;
-    #[cfg(not(windows))]
-    let base = env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .context("não foi possível localizar a pasta de estado do usuário")?;
-    Ok(base.join("path-to-link").join("daemon.json"))
-}
-
-fn read_daemon_config() -> Result<Option<DaemonConfig>> {
-    let path = daemon_config_path()?;
-    match fs::read(&path) {
-        Ok(contents) => Ok(Some(
-            serde_json::from_slice(&contents).context("arquivo de estado local inválido")?,
-        )),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => {
-            Err(error).with_context(|| format!("não foi possível ler {}", path.display()))
+        if let Some(path) = path.strip_prefix(r"\\?\") {
+            if path.as_bytes().get(1) == Some(&b':') {
+                return path.into();
+            }
         }
     }
-}
-
-fn save_daemon_config(config: &DaemonConfig) -> Result<()> {
-    let path = daemon_config_path()?;
-    let parent = path.parent().context("caminho de estado inválido")?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("não foi possível criar {}", parent.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    let contents = serde_json::to_vec(config)?;
-    fs::write(&path, contents)
-        .with_context(|| format!("não foi possível gravar {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-    }
-    Ok(())
-}
-
-fn clear_daemon_config() -> Result<()> {
-    let path = daemon_config_path()?;
-    match fs::remove_file(&path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("não foi possível remover {}", path.display()))
-        }
-    }
-}
-
-async fn run_managed_server() -> Result<()> {
-    let token = env::var(CONTROL_TOKEN_ENV).context("token interno do servidor ausente")?;
-    if !valid_control_token(&token) {
-        bail!("token interno do servidor inválido");
-    }
-    let address: SocketAddr = LOCAL_SERVER_ADDRESS.parse()?;
-    let listener = TcpListener::bind(address)
-        .await
-        .with_context(|| format!("não foi possível abrir {LOCAL_SERVER_URL}"))?;
-    let base_url = Url::parse(&format!("http://{address}/"))?;
-    let state = AppState::new(Vec::new(), base_url, &token);
-    tracing::info!(%address, "Path-to-Link local server started");
-    run_server(listener, state).await
+    path.into()
 }
 
 async fn run_mcp(args: McpArgs) -> Result<()> {
@@ -450,7 +246,9 @@ async fn run_mcp(args: McpArgs) -> Result<()> {
 
     let http_state = state.clone();
     let http_task = tokio::spawn(async move {
-        if let Err(error) = run_server(listener, http_state).await {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let router = http_api::router(http_state.clone(), shutdown_tx);
+        if let Err(error) = run_server(listener, http_state, router, shutdown_rx).await {
             tracing::error!(%error, "Path-to-Link HTTP server stopped");
         }
     });
@@ -469,10 +267,12 @@ async fn run_mcp(args: McpArgs) -> Result<()> {
     result
 }
 
-async fn run_server(listener: TcpListener, state: AppState) -> Result<()> {
-    let cleanup_state = state.clone();
-    let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-    let router: Router = http_api::router(state, shutdown_tx);
+async fn run_server(
+    listener: TcpListener,
+    cleanup_state: AppState,
+    router: Router,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
     let cleanup_task = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(30));
         loop {
@@ -486,7 +286,11 @@ async fn run_server(listener: TcpListener, state: AppState) -> Result<()> {
     let shutdown = async move {
         tokio::select! {
             _ = shutdown_rx.changed() => {},
-            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            } => {},
         }
     };
     let result = axum::serve(listener, router)

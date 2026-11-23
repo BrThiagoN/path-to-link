@@ -14,16 +14,28 @@ use tower_http::services::ServeFile;
 use crate::{AppState, CreateShareRequest};
 
 pub fn router(state: AppState, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Router {
+    routes().layer(Extension(shutdown_tx)).with_state(state)
+}
+
+pub fn managed_router(
+    state: AppState,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    instance: String,
+) -> Router {
+    routes()
+        .route("/api/instance", get(move || async move { instance }))
+        .layer(Extension(shutdown_tx))
+        .with_state(state)
+}
+
+fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/f/{id}", get(serve_file).head(serve_file))
-        .route("/api/roots", post(add_root))
         .route("/api/shares", post(create_share).get(list_shares))
         .route("/api/shares/by-path", delete(revoke_share_by_path))
         .route("/api/shares/{id}", delete(revoke_share))
         .route("/api/shutdown", post(shutdown))
-        .layer(Extension(shutdown_tx))
-        .with_state(state)
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -40,28 +52,6 @@ async fn create_share(
     }
     match state.create_share(request).await {
         Ok(share) => (StatusCode::CREATED, Json(share)).into_response(),
-        Err(message) => error(StatusCode::UNPROCESSABLE_ENTITY, &message),
-    }
-}
-
-#[derive(Deserialize)]
-struct AddRootRequest {
-    path: String,
-}
-
-async fn add_root(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<AddRootRequest>,
-) -> Response {
-    if !authorized(&state, &headers) {
-        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
-    }
-    match state
-        .add_allowed_root(std::path::Path::new(&request.path))
-        .await
-    {
-        Ok(path) => (StatusCode::CREATED, Json(json!({ "path": path }))).into_response(),
         Err(message) => error(StatusCode::UNPROCESSABLE_ENTITY, &message),
     }
 }

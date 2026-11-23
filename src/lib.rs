@@ -24,7 +24,7 @@ pub struct AppState {
 }
 
 struct AppStateInner {
-    allowed_roots: RwLock<Vec<PathBuf>>,
+    allowed_roots: Option<Vec<PathBuf>>,
     base_url: Url,
     control_token_hash: [u8; 32],
     shares: RwLock<HashMap<String, ShareRecord>>,
@@ -56,9 +56,17 @@ pub struct ShareInfo {
 
 impl AppState {
     pub fn new(allowed_roots: Vec<PathBuf>, base_url: Url, control_token: &str) -> Self {
+        Self::with_roots(Some(allowed_roots), base_url, control_token)
+    }
+
+    pub fn managed(base_url: Url, control_token: &str) -> Self {
+        Self::with_roots(None, base_url, control_token)
+    }
+
+    fn with_roots(allowed_roots: Option<Vec<PathBuf>>, base_url: Url, control_token: &str) -> Self {
         Self {
             inner: Arc::new(AppStateInner {
-                allowed_roots: RwLock::new(allowed_roots),
+                allowed_roots,
                 base_url,
                 control_token_hash: token_hash(control_token),
                 shares: RwLock::new(HashMap::new()),
@@ -72,28 +80,6 @@ impl AppState {
             .into()
     }
 
-    pub async fn add_allowed_root(&self, root: &Path) -> Result<PathBuf, String> {
-        let canonical = tokio::fs::canonicalize(root)
-            .await
-            .map_err(|_| format!("allowed root does not exist: {}", root.display()))?;
-        if !tokio::fs::metadata(&canonical)
-            .await
-            .map_err(|_| format!("allowed root cannot be accessed: {}", root.display()))?
-            .is_dir()
-        {
-            return Err(format!(
-                "allowed root is not a directory: {}",
-                root.display()
-            ));
-        }
-
-        let mut roots = self.inner.allowed_roots.write().await;
-        if !roots.contains(&canonical) {
-            roots.push(canonical.clone());
-        }
-        Ok(canonical)
-    }
-
     pub async fn create_share(&self, request: CreateShareRequest) -> Result<ShareInfo, String> {
         let expires_in = request.expires_in.unwrap_or(DEFAULT_EXPIRATION_SECONDS);
         if !(1..=MAX_EXPIRATION_SECONDS).contains(&expires_in) {
@@ -103,10 +89,16 @@ impl AppState {
         }
 
         let requested_path = PathBuf::from(&request.path);
+        if !requested_path.is_absolute() && self.inner.allowed_roots.is_none() {
+            return Err("managed shares require an absolute path".to_string());
+        }
         let canonical_path = tokio::fs::canonicalize(&requested_path)
             .await
             .map_err(|_| "file does not exist or cannot be accessed".to_string())?;
-        if !self.is_allowed_path(&canonical_path).await {
+        if self.inner.allowed_roots.is_none() && canonical_path != requested_path {
+            return Err("file path changed before it could be shared".to_string());
+        }
+        if !self.is_allowed_path(&canonical_path) {
             return Err("file is outside the configured allowed roots".to_string());
         }
 
@@ -180,19 +172,18 @@ impl AppState {
     }
 
     pub async fn revoke_share_by_path(&self, path: &Path) -> bool {
-        let canonical_path = tokio::fs::canonicalize(path).await.ok();
+        let canonical_path = canonicalize_for_revoke(path).await;
         let mut shares = self.inner.shares.write().await;
-        let matching_ids: Vec<_> = shares
-            .iter()
-            .filter_map(|(id, record)| {
-                (record.path == path || canonical_path.as_ref() == Some(&record.path))
-                    .then(|| id.clone())
-            })
-            .collect();
-        let revoked = !matching_ids.is_empty();
-        for id in matching_ids {
-            shares.remove(&id);
-        }
+        let now = unix_time_now();
+        let mut revoked = false;
+        shares.retain(|_, record| {
+            if record.info.expires_at_unix <= now {
+                return false;
+            }
+            let matches = record.path == path || canonical_path.as_ref() == Some(&record.path);
+            revoked |= matches;
+            !matches
+        });
         revoked
     }
 
@@ -214,7 +205,9 @@ impl AppState {
         // Resolve again at request time so replacing a shared path with a symlink
         // cannot redirect a later request outside the allowed roots.
         let path = tokio::fs::canonicalize(&record.path).await.ok()?;
-        if !self.is_allowed_path(&path).await {
+        if !self.is_allowed_path(&path)
+            || (self.inner.allowed_roots.is_none() && path != record.path)
+        {
             self.revoke_share(id).await;
             return None;
         }
@@ -230,13 +223,24 @@ impl AppState {
         previous_count - shares.len()
     }
 
-    async fn is_allowed_path(&self, path: &Path) -> bool {
+    fn is_allowed_path(&self, path: &Path) -> bool {
         self.inner
             .allowed_roots
-            .read()
-            .await
-            .iter()
-            .any(|root| path.starts_with(root))
+            .as_ref()
+            .is_none_or(|roots| roots.iter().any(|root| path.starts_with(root)))
+    }
+}
+
+pub async fn canonicalize_for_revoke(path: &Path) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        if let Ok(mut candidate) = tokio::fs::canonicalize(ancestor).await {
+            candidate.extend(missing.into_iter().rev());
+            return Some(candidate);
+        }
+        missing.push(ancestor.file_name()?);
+        ancestor = ancestor.parent()?;
     }
 }
 
@@ -327,6 +331,8 @@ mod tests {
 
         assert_eq!(first.id, second.id);
         assert_eq!(first.url, second.url);
+        assert_eq!(first.created_at_unix, second.created_at_unix);
+        assert!(second.expires_at_unix > first.expires_at_unix);
         assert_eq!(second.expires_in_seconds, 600);
         assert_eq!(state.list_shares().await.len(), 1);
 
@@ -336,26 +342,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dynamically_allowed_root_can_be_shared_and_revoked_by_path() {
+    async fn managed_share_can_be_revoked_after_file_is_deleted() {
         let root = temporary_root();
         let file = root.join("sample.txt");
         tokio::fs::write(&file, "test file")
             .await
             .expect("write temporary file");
-        let state = test_state(Vec::new());
-
-        state
-            .add_allowed_root(&root)
-            .await
-            .expect("add dynamic root");
+        let state = AppState::managed(
+            Url::parse("http://127.0.0.1:38751/").unwrap(),
+            &generate_secret(),
+        );
+        let canonical = tokio::fs::canonicalize(&file).await.unwrap();
         state
             .create_share(CreateShareRequest {
-                path: file.to_string_lossy().into_owned(),
+                path: canonical.to_string_lossy().into_owned(),
                 expires_in: None,
             })
             .await
-            .expect("create share under dynamic root");
+            .expect("create share for selected file");
 
+        tokio::fs::remove_file(&file)
+            .await
+            .expect("delete shared file");
         assert!(state.revoke_share_by_path(&file).await);
         assert!(state.list_shares().await.is_empty());
 
