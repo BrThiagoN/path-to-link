@@ -9,9 +9,17 @@ permissions:
 
 jobs:
   tests:
-    name: Tests
-    runs-on: windows-latest
+    name: ${{ matrix.check }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            check: Tests
+          - os: ubuntu-latest
+            check: Tests (Linux)
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -29,5 +37,6 @@ jobs:
         run: cargo test --locked
 
       - name: Test installer checksum handling
+        if: runner.os == 'Windows'
         shell: pwsh
         run: ./tests/install-checksum.ps1
