@@ -2,29 +2,35 @@ use std::{
     env,
     fs::{self, File, OpenOptions, TryLockError},
     io::{ErrorKind, Write},
+    net::{Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
+use axum::Router;
 use path_to_link::{AppState, generate_secret, http_api};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, sync::watch};
+use tokio::{
+    net::TcpListener,
+    sync::{mpsc, oneshot, watch},
+    task::JoinHandle,
+};
 use url::Url;
 
 const LEGACY_PORT: u16 = 38751;
 const START_TIMEOUT: Duration = Duration::from_secs(5);
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Config {
     control_token: String,
     // Older versions only stored the token and used a fixed port.
     endpoint: Option<Endpoint>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Endpoint {
     port: u16,
     instance: String,
@@ -133,8 +139,14 @@ async fn inspect(path: &Path, client: &Client) -> Result<Daemon> {
         .get(format!("{base_url}/api/shares"))
         .bearer_auth(&config.control_token)
         .send()
-        .await
-        .context("Could not connect to the local control API")?;
+        .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(error) if managed && (error.is_connect() || error.is_request()) => {
+            return Ok(Daemon::Starting);
+        }
+        Err(error) => return Err(error).context("Could not connect to the local control API"),
+    };
     if response.status() == StatusCode::UNAUTHORIZED {
         bail!(
             "The local server rejected the control token in {}. Restore the matching state file or stop the ptl background process before retrying.",
@@ -243,26 +255,25 @@ pub async fn serve() -> Result<()> {
         }
     }
 
-    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
     let address = listener.local_addr()?;
     let instance = generate_secret();
     let control_token = generate_secret();
     let state = AppState::managed(Url::parse(&format!("http://{address}/"))?, &control_token);
+    let config = Config {
+        control_token,
+        endpoint: Some(Endpoint {
+            port: address.port(),
+            instance: instance.clone(),
+            pid: std::process::id(),
+        }),
+    };
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let router = http_api::managed_router(state.clone(), shutdown_tx, instance.clone());
-    save_config(
-        &path,
-        &Config {
-            control_token,
-            endpoint: Some(Endpoint {
-                port: address.port(),
-                instance,
-                pid: std::process::id(),
-            }),
-        },
-    )?;
+    let (port_tx, port_rx) = mpsc::channel(1);
+    let router = http_api::managed_router(state.clone(), shutdown_tx, instance, port_tx);
+    save_config(&path, &config)?;
 
-    let result = super::run_server(listener, state, router, shutdown_rx).await;
+    let result = run_managed(listener, state, router, shutdown_rx, port_rx, &path, config).await;
     let cleanup = fs::remove_file(&path);
     drop(lock);
     result?;
@@ -272,6 +283,78 @@ pub async fn serve() -> Result<()> {
         }
         _ => Ok(()),
     }
+}
+
+type ChangePortReply = oneshot::Sender<Result<SocketAddr, String>>;
+
+struct ActiveServer {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<Result<()>>,
+}
+
+impl ActiveServer {
+    fn start(listener: TcpListener, state: &AppState, router: &Router) -> Self {
+        let (stop, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(super::run_server(
+            listener,
+            state.clone(),
+            router.clone(),
+            shutdown_rx,
+        ));
+        Self { stop, task }
+    }
+}
+
+async fn run_managed(
+    listener: TcpListener,
+    state: AppState,
+    router: Router,
+    mut shutdown: watch::Receiver<bool>,
+    mut port_changes: mpsc::Receiver<ChangePortReply>,
+    path: &Path,
+    mut config: Config,
+) -> Result<()> {
+    let mut active = ActiveServer::start(listener, &state, &router);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => break,
+            result = &mut active.task => return result.context("Local server task stopped")?,
+            Some(reply) = port_changes.recv() => {
+                match bind_next_port(path, &mut config).await {
+                    Ok((listener, address)) => {
+                        state.set_local_port(address.port()).await;
+                        let old = std::mem::replace(&mut active, ActiveServer::start(listener, &state, &router));
+                        let _ = old.stop.send(true);
+                        let _ = reply.send(Ok(address));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "Could not change the local server port");
+                        let _ = reply.send(Err(error.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    drop(port_changes);
+    let _ = active.stop.send(true);
+    active.task.await.context("Local server task stopped")?
+}
+
+async fn bind_next_port(path: &Path, config: &mut Config) -> Result<(TcpListener, SocketAddr)> {
+    // The current listener stays bound while the OS assigns the new port.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .context("Could not bind a new local port")?;
+    let address = listener.local_addr()?;
+    let mut next = config.clone();
+    next.endpoint
+        .as_mut()
+        .context("Missing local server endpoint")?
+        .port = address.port();
+    save_config(path, &next)?;
+    *config = next;
+    Ok((listener, address))
 }
 
 fn state_path() -> Result<PathBuf> {

@@ -70,6 +70,42 @@ async fn local_server_lifecycle() {
     assert!(status.contains(link));
     assert!(!status.contains(r"\\?\"));
 
+    let old_url = url::Url::parse(link).unwrap();
+    let old_port = old_url.port().unwrap();
+    let change_url = old_url.join("/api/port").unwrap();
+    assert_eq!(client.post(change_url).send().await.unwrap().status(), 401);
+    let change = workspace.run(&["change", "port"]);
+    let new_base = change
+        .lines()
+        .next()
+        .unwrap()
+        .strip_prefix("Path-to-Link is now running at ")
+        .unwrap();
+    let new_port = url::Url::parse(new_base).unwrap().port().unwrap();
+    assert_ne!(new_port, old_port);
+    let mut new_url = old_url;
+    new_url.set_port(Some(new_port)).unwrap();
+    let link = new_url.as_str();
+    let status = workspace.run(&["status"]);
+    assert!(status.contains(new_base));
+    assert!(status.contains(link));
+    assert_eq!(
+        client.get(link).send().await.unwrap().text().await.unwrap(),
+        "test content"
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while tokio::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, old_port))
+        .await
+        .is_ok()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "Old port was not closed"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     let config_path = workspace.0.join("path-to-link").join("daemon.json");
     let config = fs::read(&config_path).unwrap();
     let mut invalid: serde_json::Value = serde_json::from_slice(&config).unwrap();

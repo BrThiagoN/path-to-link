@@ -8,10 +8,13 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::{AppState, CreateShareRequest};
+
+pub type PortChanges = mpsc::Sender<oneshot::Sender<Result<SocketAddr, String>>>;
 
 pub fn router(state: AppState, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Router {
     routes().layer(Extension(shutdown_tx)).with_state(state)
@@ -21,11 +24,40 @@ pub fn managed_router(
     state: AppState,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     instance: String,
+    port_changes: PortChanges,
 ) -> Router {
     routes()
         .route("/api/instance", get(move || async move { instance }))
+        .route("/api/port", post(change_port))
+        .layer(Extension(port_changes))
         .layer(Extension(shutdown_tx))
         .with_state(state)
+}
+
+async fn change_port(
+    State(state): State<AppState>,
+    Extension(port_changes): Extension<PortChanges>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+
+    let (reply, result) = oneshot::channel();
+    if port_changes.send(reply).await.is_err() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local server is shutting down",
+        );
+    }
+    match result.await {
+        Ok(Ok(address)) => format!("http://{address}").into_response(),
+        Ok(Err(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local server is shutting down",
+        ),
+    }
 }
 
 fn routes() -> Router<AppState> {
@@ -154,3 +186,4 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
+use std::net::SocketAddr;

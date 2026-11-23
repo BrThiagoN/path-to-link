@@ -30,11 +30,22 @@ enum Command {
     Close(CloseArgs),
     /// Show the local server and its active links.
     Status,
+    /// Change a setting on the running local server.
+    Change {
+        #[command(subcommand)]
+        setting: Change,
+    },
     /// Run the MCP server for an MCP client configuration.
     Mcp(McpArgs),
     /// Internal process used to run the local server in the background.
     #[command(name = "__serve", hide = true)]
     InternalServe,
+}
+
+#[derive(Debug, Subcommand)]
+enum Change {
+    /// Move the local server to another available port.
+    Port,
 }
 
 #[derive(Debug, Args)]
@@ -89,9 +100,42 @@ async fn main() -> Result<()> {
         Command::Run(args) => run_command(args).await,
         Command::Close(args) => close_command(args).await,
         Command::Status => status_command().await,
+        Command::Change {
+            setting: Change::Port,
+        } => change_port_command().await,
         Command::Mcp(args) => run_mcp(args).await,
         Command::InternalServe => daemon::serve().await,
     }
+}
+
+async fn change_port_command() -> Result<()> {
+    let api = daemon::connect(false)
+        .await?
+        .context("Path-to-Link is stopped. Start it with `ptl run`.")?;
+    let response = api
+        .client
+        .post(format!("{}/api/port", api.base_url))
+        .bearer_auth(&api.control_token)
+        .send()
+        .await
+        .context("Could not change the local server port")?;
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        bail!(
+            "This server does not support changing ports. Restart it with `ptl close all` and `ptl run`."
+        );
+    }
+    let body = response.text().await?;
+    if !status.is_success() {
+        let message: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
+        let reason = message["error"]
+            .as_str()
+            .unwrap_or("The server rejected the request");
+        bail!("Could not change the local server port: {reason}");
+    }
+    println!("Path-to-Link is now running at {body}");
+    println!("Run `ptl status` to see the updated links.");
+    Ok(())
 }
 
 async fn run_command(args: RunArgs) -> Result<()> {

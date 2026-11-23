@@ -25,9 +25,13 @@ pub struct AppState {
 
 struct AppStateInner {
     allowed_roots: Option<Vec<PathBuf>>,
-    base_url: Url,
     control_token_hash: [u8; 32],
-    shares: RwLock<HashMap<String, ShareRecord>>,
+    shares: RwLock<ShareRegistry>,
+}
+
+struct ShareRegistry {
+    base_url: Url,
+    records: HashMap<String, ShareRecord>,
 }
 
 #[derive(Clone)]
@@ -67,9 +71,11 @@ impl AppState {
         Self {
             inner: Arc::new(AppStateInner {
                 allowed_roots,
-                base_url,
                 control_token_hash: token_hash(control_token),
-                shares: RwLock::new(HashMap::new()),
+                shares: RwLock::new(ShareRegistry {
+                    base_url,
+                    records: HashMap::new(),
+                }),
             }),
         }
     }
@@ -78,6 +84,21 @@ impl AppState {
         token_hash(token)
             .ct_eq(&self.inner.control_token_hash)
             .into()
+    }
+
+    pub async fn set_local_port(&self, port: u16) {
+        let mut shares = self.inner.shares.write().await;
+        shares
+            .base_url
+            .set_port(Some(port))
+            .expect("local HTTP URLs support ports");
+        for record in shares.records.values_mut() {
+            let mut url =
+                Url::parse(&record.info.url).expect("share URLs are generated from the base URL");
+            url.set_port(Some(port))
+                .expect("local HTTP URLs support ports");
+            record.info.url = url.into();
+        }
     }
 
     pub async fn create_share(&self, request: CreateShareRequest) -> Result<ShareInfo, String> {
@@ -112,8 +133,11 @@ impl AppState {
         let now = unix_time_now();
         let expires_at = now.saturating_add(expires_in);
         let mut shares = self.inner.shares.write().await;
-        shares.retain(|_, record| record.info.expires_at_unix > now);
+        shares
+            .records
+            .retain(|_, record| record.info.expires_at_unix > now);
         if let Some(record) = shares
+            .records
             .values_mut()
             .find(|record| record.path == canonical_path)
         {
@@ -124,7 +148,7 @@ impl AppState {
 
         let id = Uuid::new_v4().simple().to_string();
         let access_token = generate_secret();
-        let mut link = self.inner.base_url.clone();
+        let mut link = shares.base_url.clone();
         link.path_segments_mut()
             .map_err(|_| "configured base URL cannot contain path segments".to_string())?
             .pop_if_empty()
@@ -146,16 +170,19 @@ impl AppState {
             access_token_hash: token_hash(&access_token),
         };
 
-        shares.insert(id, record);
+        shares.records.insert(id, record);
         Ok(info)
     }
 
     pub async fn list_shares(&self) -> Vec<ShareInfo> {
         let now = unix_time_now();
         let mut shares = self.inner.shares.write().await;
-        shares.retain(|_, record| record.info.expires_at_unix > now);
+        shares
+            .records
+            .retain(|_, record| record.info.expires_at_unix > now);
 
         let mut result: Vec<_> = shares
+            .records
             .values()
             .map(|record| {
                 let mut info = record.info.clone();
@@ -168,7 +195,7 @@ impl AppState {
     }
 
     pub async fn revoke_share(&self, id: &str) -> bool {
-        self.inner.shares.write().await.remove(id).is_some()
+        self.inner.shares.write().await.records.remove(id).is_some()
     }
 
     pub async fn revoke_share_by_path(&self, path: &Path) -> bool {
@@ -176,7 +203,7 @@ impl AppState {
         let mut shares = self.inner.shares.write().await;
         let now = unix_time_now();
         let mut revoked = false;
-        shares.retain(|_, record| {
+        shares.records.retain(|_, record| {
             if record.info.expires_at_unix <= now {
                 return false;
             }
@@ -191,9 +218,9 @@ impl AppState {
         let now = unix_time_now();
         let record = {
             let mut shares = self.inner.shares.write().await;
-            let record = shares.get(id)?.clone();
+            let record = shares.records.get(id)?.clone();
             if record.info.expires_at_unix <= now {
-                shares.remove(id);
+                shares.records.remove(id);
                 return None;
             }
             if !bool::from(token_hash(token).ct_eq(&record.access_token_hash)) {
@@ -218,9 +245,11 @@ impl AppState {
     pub async fn prune_expired(&self) -> usize {
         let now = unix_time_now();
         let mut shares = self.inner.shares.write().await;
-        let previous_count = shares.len();
-        shares.retain(|_, record| record.info.expires_at_unix > now);
-        previous_count - shares.len()
+        let previous_count = shares.records.len();
+        shares
+            .records
+            .retain(|_, record| record.info.expires_at_unix > now);
+        previous_count - shares.records.len()
     }
 
     fn is_allowed_path(&self, path: &Path) -> bool {
@@ -353,13 +382,22 @@ mod tests {
             &generate_secret(),
         );
         let canonical = tokio::fs::canonicalize(&file).await.unwrap();
-        state
+        let share = state
             .create_share(CreateShareRequest {
                 path: canonical.to_string_lossy().into_owned(),
                 expires_in: None,
             })
             .await
             .expect("create share for selected file");
+
+        state.set_local_port(38752).await;
+        let [updated] = &state.list_shares().await[..] else {
+            panic!("Expected one active share after changing ports");
+        };
+        let mut expected = Url::parse(&share.url).unwrap();
+        expected.set_port(Some(38752)).unwrap();
+        assert_eq!(updated.url, expected.as_str());
+        assert_eq!(updated.expires_at_unix, share.expires_at_unix);
 
         tokio::fs::remove_file(&file)
             .await
