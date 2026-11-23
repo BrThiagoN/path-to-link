@@ -63,8 +63,9 @@ try {
 
     $installDir = Join-Path $env:LOCALAPPDATA 'Programs\Path-to-Link'
     New-Item -ItemType Directory -Path $installDir -Force | Out-Null
-    $executablePath = Join-Path $installDir 'path-to-link.exe'
+    $executablePath = Join-Path $installDir 'ptl.exe'
     Copy-Item -LiteralPath $downloadPath -Destination $executablePath -Force
+    Copy-Item -LiteralPath $downloadPath -Destination (Join-Path $installDir 'path-to-link.exe') -Force
 
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $pathEntries = @($userPath -split ';' | Where-Object { $_ })
@@ -78,7 +79,7 @@ try {
     }
 
     Write-Host "Installed Path-to-Link to $installDir"
-    Write-Host 'Run: path-to-link --help'
+    Write-Host 'Run: ptl help'
     & $executablePath --version
 } finally {
     Remove-Item -LiteralPath $tempDir -Recurse -Force

@@ -43,7 +43,7 @@ impl PathToLinkMcp {
 #[tool_router]
 impl PathToLinkMcp {
     #[tool(
-        description = "Create a temporary HTTP link for an allowed local file. Each call creates an independent link, so multiple links can remain active simultaneously. The returned URL includes a per-share access token; do not publish it."
+        description = "Create or refresh the single temporary HTTP link for an allowed local file. Repeated calls for the same canonical path reuse the link and renew its lifetime. The returned URL includes an access token; treat it as a secret."
     )]
     async fn share_file(
         &self,
@@ -95,7 +95,7 @@ impl ServerHandler for PathToLinkMcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_instructions(
-                "Create temporary HTTP URLs for files under explicitly configured local roots. Links are independent, expire automatically, and can be revoked. The HTTP server runs on the local machine alongside this MCP stdio process.",
+                "Create temporary HTTP URLs for files under explicitly configured local roots. Sharing a path again renews its active link. Links expire automatically and can be revoked. The HTTP server runs alongside this MCP stdio process.",
             )
     }
 }

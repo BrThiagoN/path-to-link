@@ -1,25 +1,73 @@
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderMap, Request, StatusCode, header::AUTHORIZATION},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
 };
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::{mpsc, oneshot};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
 
 use crate::{AppState, CreateShareRequest};
 
-pub fn router(state: AppState) -> Router {
+pub type PortChanges = mpsc::Sender<oneshot::Sender<Result<SocketAddr, String>>>;
+
+pub fn router(state: AppState, shutdown_tx: tokio::sync::watch::Sender<bool>) -> Router {
+    routes().layer(Extension(shutdown_tx)).with_state(state)
+}
+
+pub fn managed_router(
+    state: AppState,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    instance: String,
+    port_changes: PortChanges,
+) -> Router {
+    routes()
+        .route("/api/instance", get(move || async move { instance }))
+        .route("/api/port", post(change_port))
+        .layer(Extension(port_changes))
+        .layer(Extension(shutdown_tx))
+        .with_state(state)
+}
+
+async fn change_port(
+    State(state): State<AppState>,
+    Extension(port_changes): Extension<PortChanges>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+
+    let (reply, result) = oneshot::channel();
+    if port_changes.send(reply).await.is_err() {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local server is shutting down",
+        );
+    }
+    match result.await {
+        Ok(Ok(address)) => format!("http://{address}").into_response(),
+        Ok(Err(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, &message),
+        Err(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "local server is shutting down",
+        ),
+    }
+}
+
+fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health))
         .route("/f/{id}", get(serve_file).head(serve_file))
         .route("/api/shares", post(create_share).get(list_shares))
+        .route("/api/shares/by-path", delete(revoke_share_by_path))
         .route("/api/shares/{id}", delete(revoke_share))
-        .with_state(state)
+        .route("/api/shutdown", post(shutdown))
 }
 
 async fn health() -> Json<serde_json::Value> {
@@ -63,6 +111,41 @@ async fn revoke_share(
 }
 
 #[derive(Deserialize)]
+struct RevokeByPathRequest {
+    path: String,
+}
+
+async fn revoke_share_by_path(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<RevokeByPathRequest>,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+    if state
+        .revoke_share_by_path(std::path::Path::new(&request.path))
+        .await
+    {
+        Json(json!({ "revoked": true, "path": request.path })).into_response()
+    } else {
+        error(StatusCode::NOT_FOUND, "share for this path was not found")
+    }
+}
+
+async fn shutdown(
+    State(state): State<AppState>,
+    Extension(shutdown_tx): Extension<tokio::sync::watch::Sender<bool>>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&state, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "missing or invalid control token");
+    }
+    let _ = shutdown_tx.send(true);
+    Json(json!({ "stopping": true })).into_response()
+}
+
+#[derive(Deserialize)]
 struct FileAccessQuery {
     token: Option<String>,
 }
@@ -103,3 +186,4 @@ fn authorized(state: &AppState, headers: &HeaderMap) -> bool {
 fn error(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({ "error": message }))).into_response()
 }
+use std::net::SocketAddr;
