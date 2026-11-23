@@ -3,7 +3,6 @@ use std::{
     fs::{self, File, OpenOptions, TryLockError},
     io::{ErrorKind, Write},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -153,27 +152,76 @@ async fn inspect(path: &Path, client: &Client) -> Result<Daemon> {
     }))
 }
 
+#[cfg(unix)]
 fn spawn() -> Result<()> {
+    use std::{
+        os::unix::process::CommandExt,
+        process::{Command, Stdio},
+    };
+
     let mut command = Command::new(env::current_exe().context("Could not locate ptl")?);
     command
         .arg("__serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        command.creation_flags(DETACHED_PROCESS);
-    }
-    command
+        .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
         .context("Could not start the background server")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn spawn() -> Result<()> {
+    use std::{os::windows::ffi::OsStrExt, ptr::null};
+
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        System::Threading::{
+            CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION,
+            STARTUPINFOW,
+        },
+    };
+
+    let executable: Vec<u16> = env::current_exe()
+        .context("Could not locate ptl")?
+        .as_os_str()
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut args: Vec<u16> = "ptl __serve\0".encode_utf16().collect();
+    let startup = STARTUPINFOW {
+        cb: size_of::<STARTUPINFOW>() as u32,
+        ..Default::default()
+    };
+    let mut process = PROCESS_INFORMATION::default();
+
+    // Do not inherit the CLI's pipes when the caller captures stdout or stderr.
+    // SAFETY: The strings are NUL terminated, the command line is writable, and
+    // the input and output structs stay valid for the call.
+    let created = unsafe {
+        CreateProcessW(
+            executable.as_ptr(),
+            args.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+            null(),
+            null(),
+            &startup,
+            &mut process,
+        )
+    };
+    if created == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("Could not start the background server");
+    }
+    // SAFETY: A successful CreateProcessW returns these two owned handles.
+    unsafe {
+        CloseHandle(process.hProcess);
+        CloseHandle(process.hThread);
+    }
     Ok(())
 }
 
